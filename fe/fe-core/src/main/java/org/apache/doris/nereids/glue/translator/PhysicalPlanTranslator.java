@@ -2496,14 +2496,38 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             setOperationNode.setColocate(true);
         }
 
-        // TODO: open comment when support `enable_local_shuffle_planner`
-        // for (Plan child : setOperation.children()) {
-        //     PhysicalPlan childPhysicalPlan = (PhysicalPlan) child;
-        //     if (JoinUtils.isStorageBucketed(childPhysicalPlan.getPhysicalProperties())) {
-        //         setOperationNode.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
-        //         break;
-        //     }
-        // }
+        // A storage-bucketed child means set-op bucket shuffle was chosen by
+        // ChildrenPropertiesRegulator, which only does so under the FE local-shuffle planner;
+        // the gate here keeps the two sites explicitly consistent. Mark the node BUCKET_SHUFFLE
+        // so the set sink/probe align by bucket instead of execution-bucketed hash.
+        //
+        // Unlike hash join, BUCKET_SHUFFLE is not exclusive with isColocate above: for a set
+        // operation isColocate describes the bucket-aligned scheduling of the fragment (the
+        // basic child scans buckets directly), while BUCKET_SHUFFLE describes how the other
+        // children arrive (bucket-shuffle exchanges). Both routes converge to the same
+        // bucket-hash local exchange requirement in SetOperationNode.enforceAndDeriveLocalExchange.
+        ConnectContext setOperationConnectContext = context.getConnectContext();
+        if (setOperationConnectContext != null
+                && setOperationConnectContext.getSessionVariable().isEnableLocalShuffle()
+                && setOperationConnectContext.getSessionVariable().isEnableLocalShufflePlanner()
+                && SessionVariable.canUseNereidsDistributePlanner(setOperationConnectContext)) {
+            for (Plan child : setOperation.children()) {
+                PhysicalPlan childPhysicalPlan = (PhysicalPlan) child;
+                if (!JoinUtils.isStorageBucketed(childPhysicalPlan.getPhysicalProperties())) {
+                    continue;
+                }
+                // Only trust a storage-bucketed child with a known storage layout: a hash
+                // join output can keep STORAGE_BUCKETED with the layout cleared to -1, and
+                // bucket alignment cannot be proved for an unknown bucket function.
+                DistributionSpec childSpec
+                        = childPhysicalPlan.getPhysicalProperties().getDistributionSpec();
+                if (childSpec instanceof DistributionSpecHash
+                        && ((DistributionSpecHash) childSpec).getTableId() >= 0) {
+                    setOperationNode.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+                    break;
+                }
+            }
+        }
 
         return setOperationFragment;
     }

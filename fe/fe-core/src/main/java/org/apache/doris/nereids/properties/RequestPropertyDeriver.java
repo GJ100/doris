@@ -67,6 +67,7 @@ import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.AggregateUtils;
 import org.apache.doris.nereids.util.JoinUtils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.statistics.Statistics;
 
 import com.google.common.base.Preconditions;
@@ -339,14 +340,23 @@ public class RequestPropertyDeriver extends PlanVisitor<Void, PlanContext> {
             // shuffle all column
             // TODO: for wide table, may be we should add a upper limit of shuffle columns
 
-            // TODO: open comment when support `enable_local_shuffle_planner` and change to REQUIRE
-            // intersect/except always need hash distribution, we use REQUIRE to auto select
-            // bucket shuffle or execution shuffle
+            // intersect/except always need hash distribution. Auto-selecting bucket shuffle
+            // (ShuffleType.REQUIRE) for set operation is only valid when the FE plans the local
+            // shuffle: with the BE-side local-shuffle planner the backend cannot infer the
+            // correct local shuffle type for the set sink/probe and computes wrong results.
+            // It also requires the nereids distribute planner: the legacy coordinator only
+            // supports bucket-shuffle-partitioned sinks whose dest fragment contains a bucket
+            // shuffle join. Fall back to EXECUTION_BUCKETED otherwise.
+            ShuffleType setOperationShuffleType = connectContext != null
+                    && connectContext.getSessionVariable().isEnableLocalShuffle()
+                    && connectContext.getSessionVariable().isEnableLocalShufflePlanner()
+                    && SessionVariable.canUseNereidsDistributePlanner(connectContext)
+                    ? ShuffleType.REQUIRE : ShuffleType.EXECUTION_BUCKETED;
             addRequestPropertyToChildren(setOperation.getRegularChildrenOutputs().stream()
                     .map(childOutputs -> childOutputs.stream()
                             .map(SlotReference::getExprId)
                             .collect(ImmutableList.toImmutableList()))
-                    .map(l -> PhysicalProperties.createHash(l, ShuffleType.EXECUTION_BUCKETED))
+                    .map(l -> PhysicalProperties.createHash(l, setOperationShuffleType))
                     .collect(Collectors.toList()));
         }
         return null;

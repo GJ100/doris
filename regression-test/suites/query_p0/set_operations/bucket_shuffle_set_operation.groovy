@@ -16,9 +16,6 @@
 // under the License.
 
 suite("bucket_shuffle_set_operation") {
-    // TODO: open comment when support `enable_local_shuffle_planner` and change to REQUIRE
-    return
-
     multi_sql """
         drop table if exists bucket_shuffle_set_operation1;
         create table bucket_shuffle_set_operation1(id int, value int) distributed by hash(id) buckets 10 properties('replication_num'='1');
@@ -37,6 +34,9 @@ suite("bucket_shuffle_set_operation") {
 
     // make bucket shuffle set operation stable
     sql "set parallel_pipeline_task_num=5"
+    // disable the bucket shuffle downgrade so the chosen shapes do not depend on the
+    // backend count / parallelism of the environment running this suite
+    sql "set bucket_shuffle_downgrade_ratio=0"
 
     def checkShapeAndResult = { String tag, String sqlStr ->
         quickTest(tag + "_shape", "explain shape plan " + sqlStr)
@@ -94,6 +94,36 @@ suite("bucket_shuffle_set_operation") {
         except
         select id from bucket_shuffle_set_operation2 where id=1
         """)
+
+    // The basic child of a bucket-shuffle set operation can be a join output instead of a
+    // direct scan. In that shape the local exchange planned for the basic side must still
+    // partition by the storage bucket function: an execution-hash local exchange would not
+    // align with the bucket-distributed side and the set operation would compute wrong results.
+    checkShapeAndResult("bucket_shuffle_join_as_basic_child", """
+        select a.id from bucket_shuffle_set_operation1 a
+        join bucket_shuffle_set_operation2 b on a.id = b.id
+        intersect
+        select id from bucket_shuffle_set_operation3""")
+
+    // a set operation child can itself be a set operation whose output claims a bucket
+    // distribution; the outer set operation must only treat its children as bucket-aligned
+    // when they share the same storage layout
+    checkShapeAndResult("bucket_shuffle_nested_set_operation", """
+        select id from bucket_shuffle_set_operation3
+        union all
+        (select a.id from bucket_shuffle_set_operation1 a
+        join bucket_shuffle_set_operation2 b on a.id = b.id
+        intersect
+        select id from bucket_shuffle_set_operation2)""")
+
+    // bucket shuffle for set operation relies on the FE-planned local exchanges for the set
+    // sink/probe alignment, so it must not be chosen when local shuffle is disabled entirely
+    sql "set enable_local_shuffle=false"
+    checkShapeAndResult("no_bucket_shuffle_when_local_shuffle_off", """
+        select id from bucket_shuffle_set_operation1
+        intersect
+        select id from bucket_shuffle_set_operation2""")
+    sql "set enable_local_shuffle=true"
 
     explain {
         sql """
