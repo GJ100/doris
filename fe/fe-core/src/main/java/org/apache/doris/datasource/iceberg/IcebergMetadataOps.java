@@ -41,8 +41,6 @@ import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.ExternalDatabase;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.operations.ExternalMetadataOps;
-import org.apache.doris.datasource.property.metastore.IcebergRestProperties;
-import org.apache.doris.datasource.property.metastore.MetastoreProperties;
 import org.apache.doris.filesystem.FileEntry;
 import org.apache.doris.filesystem.FileIterator;
 import org.apache.doris.filesystem.FileSystem;
@@ -95,7 +93,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class IcebergMetadataOps implements ExternalMetadataOps {
 
@@ -119,9 +116,9 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
         nsCatalog = (SupportsNamespaces) catalog;
         this.executionAuthenticator = dorisCatalog.getExecutionAuthenticator();
 
-        if (dorisCatalog.getProperties().containsKey(IcebergExternalCatalog.EXTERNAL_CATALOG_NAME)) {
+        if (dorisCatalog.getProperties().containsKey(IcebergCatalogConstants.EXTERNAL_CATALOG_NAME)) {
             externalCatalogName =
-                Optional.of(dorisCatalog.getProperties().get(IcebergExternalCatalog.EXTERNAL_CATALOG_NAME));
+                Optional.of(dorisCatalog.getProperties().get(IcebergCatalogConstants.EXTERNAL_CATALOG_NAME));
         }
     }
 
@@ -169,22 +166,6 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
 
     @NotNull
     private List<String> listNestedNamespaces(Namespace parentNs) {
-        // Handle nested namespaces for Iceberg REST catalog,
-        // only if "iceberg.rest.nested-namespace-enabled" is true.
-        if (dorisCatalog instanceof IcebergRestExternalCatalog) {
-            IcebergRestExternalCatalog restCatalog = (IcebergRestExternalCatalog) dorisCatalog;
-            MetastoreProperties metaProps = restCatalog.getCatalogProperty().getMetastoreProperties();
-            if (metaProps instanceof IcebergRestProperties
-                    && ((IcebergRestProperties) metaProps).isIcebergRestNestedNamespaceEnabled()) {
-                return nsCatalog.listNamespaces(parentNs)
-                        .stream()
-                        .flatMap(childNs -> Stream.concat(
-                                Stream.of(childNs.toString()),
-                                listNestedNamespaces(childNs).stream()
-                        )).collect(Collectors.toList());
-            }
-        }
-
         return nsCatalog.listNamespaces(parentNs)
                 .stream()
                 .map(n -> n.level(n.length() - 1))
@@ -248,13 +229,6 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
                 return true;
             } else {
                 ErrorReport.reportDdlException(ErrorCode.ERR_DB_CREATE_EXISTS, dbName);
-            }
-        }
-        if (!properties.isEmpty() && dorisCatalog instanceof IcebergExternalCatalog) {
-            String icebergCatalogType = ((IcebergExternalCatalog) dorisCatalog).getIcebergCatalogType();
-            if (!IcebergExternalCatalog.ICEBERG_HMS.equals(icebergCatalogType)) {
-                throw new DdlException(
-                    "Not supported: create database with properties for iceberg catalog type: " + icebergCatalogType);
             }
         }
         nsCatalog.createNamespace(getNamespace(dbName), properties);
@@ -487,10 +461,10 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
     }
 
     private boolean shouldCleanupManagedLocation() {
-        // Only cleanup HMS-Iceberg location
-        return dorisCatalog instanceof IcebergExternalCatalog
-                && IcebergExternalCatalog.ICEBERG_HMS.equals(
-                        ((IcebergExternalCatalog) dorisCatalog).getIcebergCatalogType());
+        // Native HMS-flavor iceberg managed-location cleanup moved to the connector
+        // (IcebergConnectorMetadata.cleanupEmptyManagedLocation). Post-cutover this ops instance only ever
+        // backs an HMSExternalCatalog (an hms catalog holding iceberg tables), which never cleaned up here.
+        return false;
     }
 
     @VisibleForTesting
@@ -1316,12 +1290,6 @@ public class IcebergMetadataOps implements ExternalMetadataOps {
     private boolean isViewCatalogEnabled() {
         if (!(catalog instanceof ViewCatalog)) {
             return false;
-        }
-        if (dorisCatalog instanceof IcebergRestExternalCatalog) {
-            MetastoreProperties metaProps = dorisCatalog.getCatalogProperty().getMetastoreProperties();
-            if (metaProps instanceof IcebergRestProperties) {
-                return ((IcebergRestProperties) metaProps).isIcebergRestViewEnabled();
-            }
         }
         return true;
     }
